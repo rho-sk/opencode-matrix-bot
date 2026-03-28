@@ -77,8 +77,8 @@ func StartSSEListener(
 
 // trackedSessions is a thread-safe set of session IDs being monitored.
 type trackedSessions struct {
-	mu   sync.RWMutex
-	ids  map[string]bool
+	mu  sync.RWMutex
+	ids map[string]bool
 	// childOf maps childID -> parentID (for logging)
 	childOf map[string]string
 }

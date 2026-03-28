@@ -76,6 +76,7 @@ func (c *OpencodeClient) GetMessages(ctx context.Context, sessionID string, limi
 	}
 	return all, nil
 }
+
 // AbortSession aborts a running session.
 func (c *OpencodeClient) AbortSession(ctx context.Context, sessionID string) error {
 	_, err := c.sdk.Session.Abort(ctx, sessionID, opencode.SessionAbortParams{})
