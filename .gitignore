@@ -1,0 +1,28 @@
+# Binary output
+opencode-matrix-bot
+dist/
+
+# Environment / secrets
+.env
+deploy.local/.env
+
+# Editor and OS artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Test and coverage output
+*.test
+*.out
+coverage.html
+coverage.txt
+
+# Log files
+*.log
+
+# Release artifacts
+*.tar.gz
+*.zip

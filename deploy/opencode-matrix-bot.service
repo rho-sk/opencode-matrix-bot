@@ -1,0 +1,15 @@
+[Unit]
+Description=Opencode Matrix Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opencode-bot
+EnvironmentFile=/etc/opencode-matrix-bot/.env
+ExecStart=/usr/local/bin/opencode-matrix-bot --log-level info
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

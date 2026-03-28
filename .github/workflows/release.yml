@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needed for git-cliff to read full history
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - name: Generate CHANGELOG for this release
+        run: git-cliff --current --output release-notes.md
+
+      - name: Build release tarballs
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          COMMIT="${GITHUB_SHA::8}"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${DATE}"
+
+          mkdir -p dist
+
+          for PLATFORM in linux/amd64 linux/arm64; do
+            GOOS=$(echo $PLATFORM | cut -d/ -f1)
+            GOARCH=$(echo $PLATFORM | cut -d/ -f2)
+            OUTDIR="dist/opencode-matrix-bot_${VERSION}_${GOOS}_${GOARCH}"
+            mkdir -p "$OUTDIR"
+
+            echo "Building ${GOOS}/${GOARCH}..."
+            GOOS=$GOOS GOARCH=$GOARCH go build \
+              -ldflags "$LDFLAGS" \
+              -o "${OUTDIR}/opencode-matrix-bot" .
+
+            cp deploy/opencode-matrix-bot.service "$OUTDIR/"
+            cp .env.example "$OUTDIR/"
+            cp docs/installation.md "$OUTDIR/"
+            cp CHANGELOG.md "$OUTDIR/" 2>/dev/null || true
+
+            tar -czf "dist/opencode-matrix-bot_${VERSION}_${GOOS}_${GOARCH}.tar.gz" \
+              -C dist "opencode-matrix-bot_${VERSION}_${GOOS}_${GOARCH}"
+            rm -rf "$OUTDIR"
+          done
+
+          # Generate SHA256 checksums
+          cd dist && sha256sum *.tar.gz > checksums.txt && cd ..
+
+          echo "Built artifacts:"
+          ls -lh dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Release ${{ github.ref_name }}"
+          body_path: release-notes.md
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
