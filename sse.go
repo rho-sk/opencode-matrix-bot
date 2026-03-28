@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 // the official SDK and forwards relevant events to the Matrix room.
 //
 // typingFn: called with true when processing starts, false when done.
+// onPermission: called when a permission request arrives (sessionID, Permission).
 func StartSSEListener(
 	ctx context.Context,
 	cfg *Config,
@@ -24,6 +26,7 @@ func StartSSEListener(
 	sendMsg func(id.RoomID, string),
 	lastMsgID string,
 	typingFn func(bool),
+	onPermission func(string, *opencode.Permission),
 ) context.CancelFunc {
 	childCtx, cancel := context.WithCancel(ctx)
 
@@ -42,7 +45,7 @@ func StartSSEListener(
 			default:
 			}
 
-			err := runSDKSSELoop(childCtx, oc, attachedID, roomID, sendMsg, lastMsgID, typingFn)
+			err := runSDKSSELoop(childCtx, oc, attachedID, roomID, sendMsg, lastMsgID, typingFn, onPermission)
 			if err != nil {
 				select {
 				case <-childCtx.Done():
@@ -121,6 +124,7 @@ func runSDKSSELoop(
 	sendMsg func(id.RoomID, string),
 	lastMsgID string,
 	typingFn func(bool),
+	onPermission func(string, *opencode.Permission),
 ) error {
 	// Wrap context with a heartbeat timeout — if no event arrives for 90s, reconnect
 	const heartbeatTimeout = 90 * time.Second
@@ -284,6 +288,24 @@ func runSDKSSELoop(
 				sendMsg(roomID, "❌ Chyba v session")
 			}
 
+		case opencode.EventListResponseTypePermissionUpdated:
+			perm, ok := evt.Properties.(opencode.Permission)
+			if !ok {
+				continue
+			}
+			if !tracked.contains(perm.SessionID) {
+				continue
+			}
+
+			// Format and send permission message
+			msg := formatPermissionMessage(&perm)
+			sendMsg(roomID, msg)
+
+			// Notify bot about pending permission
+			if onPermission != nil {
+				onPermission(perm.SessionID, &perm)
+			}
+
 		case opencode.EventListResponseTypeSessionCreated:
 			props, ok := evt.Properties.(opencode.EventListResponseEventSessionCreatedProperties)
 			if !ok {
@@ -311,4 +333,18 @@ func runSDKSSELoop(
 		}
 	}
 	return nil
+}
+
+// formatPermissionMessage formats a permission request as a user-friendly message.
+func formatPermissionMessage(perm *opencode.Permission) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("❓ Permission Request: %s\n", perm.Title))
+	if perm.Pattern != nil {
+		sb.WriteString(fmt.Sprintf("Pattern: %v\n", perm.Pattern))
+	}
+	sb.WriteString("\nAvailable commands:\n")
+	sb.WriteString("/allow-once — Grant once\n")
+	sb.WriteString("/allow-always — Grant always\n")
+	sb.WriteString("/deny — Reject")
+	return sb.String()
 }

@@ -201,6 +201,18 @@ func (c *OpencodeClient) GetLastMessageID(ctx context.Context, sessionID string)
 	return msgs[0].Info.ID, nil
 }
 
+// RespondToPermission responds to a permission request.
+// response can be "once", "always", or "reject".
+func (c *OpencodeClient) RespondToPermission(ctx context.Context, sessionID string, permissionID string, response string) error {
+	_, err := c.sdk.Session.Permissions.Respond(ctx, sessionID, permissionID, opencode.SessionPermissionRespondParams{
+		Response: opencode.F(opencode.SessionPermissionRespondParamsResponse(response)),
+	})
+	if err != nil {
+		return fmt.Errorf("respond to permission: %w", err)
+	}
+	return nil
+}
+
 // setAuth adds Basic Auth header if password is configured.
 func (c *OpencodeClient) setAuth(req *http.Request) {
 	if c.cfg.OpencodePassword != "" {
