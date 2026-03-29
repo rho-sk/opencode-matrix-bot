@@ -254,7 +254,8 @@ func runSDKSSELoop(
 
 					// Parse tokens from this step
 					if part.Tokens != nil {
-						// Try as map (JSON unmarshaling gives us map[string]interface{})
+						// Tokens can be a struct (opencode.StepFinishPartTokens) or map
+						// Try as map first, if not a map then marshal/unmarshal to get values
 						if tokensMap, ok := part.Tokens.(map[string]interface{}); ok {
 							if input, ok := tokensMap["input"].(float64); ok {
 								inputTokens = int(input)
@@ -265,6 +266,24 @@ func runSDKSSELoop(
 							if cacheObj, ok := tokensMap["cache"].(map[string]interface{}); ok {
 								if read, ok := cacheObj["read"].(float64); ok {
 									cacheTokens = int(read)
+								}
+							}
+						} else {
+							// Token is likely a struct, convert via JSON
+							if data, err := json.Marshal(part.Tokens); err == nil {
+								var tokensMap map[string]interface{}
+								if err := json.Unmarshal(data, &tokensMap); err == nil {
+									if input, ok := tokensMap["input"].(float64); ok {
+										inputTokens = int(input)
+									}
+									if output, ok := tokensMap["output"].(float64); ok {
+										outputTokens = int(output)
+									}
+									if cacheObj, ok := tokensMap["cache"].(map[string]interface{}); ok {
+										if read, ok := cacheObj["read"].(float64); ok {
+											cacheTokens = int(read)
+										}
+									}
 								}
 							}
 						}

@@ -332,8 +332,8 @@ func (b *Bot) cmdContext(ctx context.Context, roomID id.RoomID) {
 	cost := state.TotalCost
 	b.mu.Unlock()
 
-	if totalTokens == 0 && cost == 0 {
-		b.sendMsg(roomID, "📊 No token or cost data collected yet in this session.")
+	if totalTokens == 0 {
+		b.sendMsg(roomID, "📊 No token data collected yet in this session.")
 		return
 	}
 
