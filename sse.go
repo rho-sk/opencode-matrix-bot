@@ -349,6 +349,18 @@ func runSDKSSELoop(
 					flushed = true
 				}
 			}
+
+			// Ensure final token/cost update is reported when session goes idle
+			if sid == attachedID && (totalTokensInput > 0 || totalTokensOutput > 0 || totalCost > 0) {
+				log.Info().
+					Int("totalInput", totalTokensInput).
+					Int("totalOutput", totalTokensOutput).
+					Int("totalCache", totalTokensCache).
+					Float64("totalCost", totalCost).
+					Msg("Session idle: final token/cost counts")
+				onTokensUpdate(totalTokensInput, totalTokensOutput, totalTokensCache, totalCost)
+			}
+
 			deltaAccum = map[string]string{}
 			deltaLastSent = map[string]int{}
 			announcedTools = map[string]bool{}
