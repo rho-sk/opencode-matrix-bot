@@ -344,10 +344,10 @@ func (b *Bot) cmdContext(ctx context.Context, roomID id.RoomID) {
 	if state.TokensCache > 0 {
 		msg += fmt.Sprintf("  💾 Cache read: %s\n", formatNumber(state.TokensCache))
 	}
-	msg += fmt.Sprintf("  **Total: %s**\n\n", formatNumber(totalTokens))
+	msg += fmt.Sprintf("  **Total: %s**\n", formatNumber(totalTokens))
 
 	if cost > 0 {
-		msg += fmt.Sprintf("💰 **Cost:** $%.4f", cost)
+		msg += fmt.Sprintf("\n💰 **Cost:** $%.4f", cost)
 	}
 
 	b.sendMsg(roomID, msg)
