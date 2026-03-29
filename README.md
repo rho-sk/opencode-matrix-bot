@@ -37,6 +37,12 @@ The bot connects **outward** to matrix.org — no open ports or tunnels required
 - `/reject_all` — cancel entire question sequence
 - All answers accumulated and submitted together upon completion
 
+### Context Tracking
+- Real-time token usage tracking (input, output, cache)
+- `/context` — display accumulated tokens and cost for session
+- Cost tracking ready for providers that support it
+- Formatted with thousand separators for readability
+
 ### Other Features
 - Rotating log files (5 MB × 10 backups) with configurable log level
 - Single static binary, runs as a systemd service
@@ -120,6 +126,7 @@ All configuration is read from environment variables or a `.env` file in the wor
 | `/attach <ID>` | Attach to a session (first 8 chars of ID are enough) |
 | `/detach` | Detach from current session |
 | `/status` | Show status of attached session |
+| `/context` | Show token usage and cost for current session |
 | `/todo` | Show TODO list of attached session |
 | `/abort` | Abort the running session |
 | `/new [title]` | Create a new session and attach to it |
@@ -209,6 +216,23 @@ Bot: 🔐 Permission Request
 You: /allow-once
 Bot: ✅ Permission: file.read (once)
 ```
+
+### Context Usage Example
+
+```
+You: /context
+Bot: 📊 **Context Usage**
+
+**Tokens:**
+  ↑ Input: 1,234
+  ↓ Output: 5,678
+  💾 Cache read: 456
+  **Total: 7,368**
+
+💰 **Cost:** $0.0234
+```
+
+Note: Cost is only displayed if your AI provider includes cost information in responses.
 
 ## Building from source
 
