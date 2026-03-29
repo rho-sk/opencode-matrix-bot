@@ -244,26 +244,55 @@ func runSDKSSELoop(
 
 			case opencode.PartTypeStepFinish:
 				// Track tokens and cost from step finish
-				if !tokenTracked[part.ID] && part.Tokens != nil {
+				// Each StepFinish contains tokens for this individual step
+				if !tokenTracked[part.ID] {
 					tokenTracked[part.ID] = true
-					// Parse tokens JSON
-					if tokensMap, ok := part.Tokens.(map[string]interface{}); ok {
-						if input, ok := tokensMap["input"].(float64); ok {
-							totalTokensInput += int(input)
-						}
-						if output, ok := tokensMap["output"].(float64); ok {
-							totalTokensOutput += int(output)
-						}
-						if cacheObj, ok := tokensMap["cache"].(map[string]interface{}); ok {
-							if read, ok := cacheObj["read"].(float64); ok {
-								totalTokensCache += int(read)
+
+					inputTokens := 0
+					outputTokens := 0
+					cacheTokens := 0
+
+					// Parse tokens from this step
+					if part.Tokens != nil {
+						// Try as map (JSON unmarshaling gives us map[string]interface{})
+						if tokensMap, ok := part.Tokens.(map[string]interface{}); ok {
+							if input, ok := tokensMap["input"].(float64); ok {
+								inputTokens = int(input)
+							}
+							if output, ok := tokensMap["output"].(float64); ok {
+								outputTokens = int(output)
+							}
+							if cacheObj, ok := tokensMap["cache"].(map[string]interface{}); ok {
+								if read, ok := cacheObj["read"].(float64); ok {
+									cacheTokens = int(read)
+								}
 							}
 						}
 					}
-				}
-				// Track cost
-				if part.Cost > 0 {
-					totalCost += part.Cost
+
+					// Add this step's tokens to session totals
+					totalTokensInput += inputTokens
+					totalTokensOutput += outputTokens
+					totalTokensCache += cacheTokens
+
+					// Add cost
+					if part.Cost > 0 {
+						totalCost += part.Cost
+					}
+
+					log.Info().
+						Str("partID", part.ID).
+						Int("stepInput", inputTokens).
+						Int("stepOutput", outputTokens).
+						Int("stepCache", cacheTokens).
+						Float64("stepCost", part.Cost).
+						Int("totalInput", totalTokensInput).
+						Int("totalOutput", totalTokensOutput).
+						Int("totalCache", totalTokensCache).
+						Float64("totalCost", totalCost).
+						Msg("StepFinish: tokens and cost accumulated")
+
+					// Report updated session totals
 					onTokensUpdate(totalTokensInput, totalTokensOutput, totalTokensCache, totalCost)
 				}
 
