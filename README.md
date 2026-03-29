@@ -16,11 +16,28 @@ The bot connects **outward** to matrix.org — no open ports or tunnels required
 
 ## Features
 
+### Session Management
 - Send messages to an OpenCode session from any Matrix client
 - List, attach, detach, and create sessions
 - Real-time streaming via SSE: tool invocations and AI responses delivered as Matrix messages
 - `/todo` — view the active TODO list
 - `/abort` — interrupt a running session
+
+### Permissions Handling
+- Interactive permission requests from OpenCode
+- `/allow-once` — grant permission for single use
+- `/allow-always` — grant permission permanently
+- `/deny` — reject permission request
+
+### Questions & Interactive Input
+- Progressive multi-question sequences with "Question X/Y" indicator
+- Step-by-step answering via `/answer <text or number>`
+- Support for both predefined options and custom text answers
+- `/reject` — skip current question
+- `/reject_all` — cancel entire question sequence
+- All answers accumulated and submitted together upon completion
+
+### Other Features
 - Rotating log files (5 MB × 10 backups) with configurable log level
 - Single static binary, runs as a systemd service
 
@@ -95,6 +112,7 @@ All configuration is read from environment variables or a `.env` file in the wor
 
 ## Commands
 
+### Session Management
 | Command | Description |
 |---|---|
 | `/help` | Show all commands |
@@ -105,9 +123,27 @@ All configuration is read from environment variables or a `.env` file in the wor
 | `/todo` | Show TODO list of attached session |
 | `/abort` | Abort the running session |
 | `/new [title]` | Create a new session and attach to it |
+
+### Permissions
+| Command | Description |
+|---|---|
+| `/allow-once` | Grant permission for single use |
+| `/allow-always` | Grant permission permanently |
+| `/deny` | Reject permission request |
+
+### Questions (Step-by-step)
+| Command | Description |
+|---|---|
+| `/answer <text\|number>` | Answer current question with text or option number |
+| `/reject` | Skip current question (submit empty answer) |
+| `/reject_all` | Cancel entire question sequence |
+
+### General
 | *(any other text)* | Send as a prompt to the attached session |
 
 ## Usage
+
+### Running the bot
 
 ```bash
 # Run with default log level (info)
@@ -122,6 +158,57 @@ opencode-matrix-bot --version
 
 Logs are written to `/var/log/opencode-matrix-bot/opencode-matrix-bot.log`  
 (fallback: `~/.local/share/opencode-matrix-bot/logs/`) and also to stderr.
+
+### Example Workflow
+
+```
+You: /attach abc12345
+Bot: ✅ Attached to session abc12345 (title: "My Project")
+
+You: Create a setup wizard that asks 3 questions
+Bot: 🔧 `file_write`
+Bot: ⏳ Processing...
+Bot: ❓ Question 1/3
+     What is your name?
+     Respond with: /answer <text>
+
+You: /answer Alice
+Bot: ❓ Question 2/3
+     Choose framework: 
+     1. FastAPI
+     2. Django
+     3. Flask
+     Respond with: /answer <number>
+
+You: /answer 1
+Bot: ❓ Question 3/3
+     Use PostgreSQL?
+     1. Yes
+     2. No
+     Respond with: /answer <number>
+
+You: /answer 1
+Bot: ✅ All questions answered: 3 answers submitted
+Bot: Based on your answers: Alice, FastAPI, PostgreSQL...
+
+You: /status
+Bot: 🟢 running
+```
+
+### Permission Request Example
+
+```
+Bot: 🔐 Permission Request
+     Permission: file.read
+     Patterns: src/**/*.ts
+     Respond with:
+     - /allow-once — Grant for this operation
+     - /allow-always — Grant permanently
+     - /deny — Reject
+
+You: /allow-once
+Bot: ✅ Permission: file.read (once)
+```
 
 ## Building from source
 
