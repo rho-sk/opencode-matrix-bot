@@ -32,6 +32,7 @@ type QuestionRequest struct {
 // typingFn: called with true when processing starts, false when done.
 // onPermission: called when a permission request arrives.
 // onQuestion: called when a question request arrives.
+// onTokensUpdate: called when tokens/cost info is available (inputTokens, outputTokens, cacheTokens, cost).
 func StartSSEListener(
 	ctx context.Context,
 	cfg *Config,
@@ -43,6 +44,7 @@ func StartSSEListener(
 	typingFn func(bool),
 	onPermission func(PermissionRequest),
 	onQuestion func(QuestionRequest),
+	onTokensUpdate func(int, int, int, float64),
 ) context.CancelFunc {
 	childCtx, cancel := context.WithCancel(ctx)
 
@@ -61,7 +63,7 @@ func StartSSEListener(
 			default:
 			}
 
-			err := runSDKSSELoop(childCtx, oc, attachedID, roomID, sendMsg, lastMsgID, typingFn, onPermission, onQuestion)
+			err := runSDKSSELoop(childCtx, oc, attachedID, roomID, sendMsg, lastMsgID, typingFn, onPermission, onQuestion, onTokensUpdate)
 			if err != nil {
 				select {
 				case <-childCtx.Done():
@@ -142,6 +144,7 @@ func runSDKSSELoop(
 	typingFn func(bool),
 	onPermission func(PermissionRequest),
 	onQuestion func(QuestionRequest),
+	onTokensUpdate func(int, int, int, float64),
 ) error {
 	// Wrap context with a heartbeat timeout — if no event arrives for 90s, reconnect
 	const heartbeatTimeout = 90 * time.Second
@@ -169,6 +172,13 @@ func runSDKSSELoop(
 	// assistantMessages tracks messageIDs confirmed as assistant messages
 	// (identified by seeing a step-start part for that messageID)
 	assistantMessages := map[string]bool{}
+
+	// Token and cost tracking per part (to avoid duplicate counting)
+	tokenTracked := map[string]bool{}
+	totalTokensInput := 0
+	totalTokensOutput := 0
+	totalTokensCache := 0
+	totalCost := 0.0
 
 	// typingActive tracks whether we currently have typing indicator on
 	typingActive := false
@@ -231,6 +241,31 @@ func runSDKSSELoop(
 				// Mark this messageID as an assistant message and show typing indicator
 				assistantMessages[part.MessageID] = true
 				startTyping()
+
+			case opencode.PartTypeStepFinish:
+				// Track tokens and cost from step finish
+				if !tokenTracked[part.ID] && part.Tokens != nil {
+					tokenTracked[part.ID] = true
+					// Parse tokens JSON
+					if tokensMap, ok := part.Tokens.(map[string]interface{}); ok {
+						if input, ok := tokensMap["input"].(float64); ok {
+							totalTokensInput += int(input)
+						}
+						if output, ok := tokensMap["output"].(float64); ok {
+							totalTokensOutput += int(output)
+						}
+						if cacheObj, ok := tokensMap["cache"].(map[string]interface{}); ok {
+							if read, ok := cacheObj["read"].(float64); ok {
+								totalTokensCache += int(read)
+							}
+						}
+					}
+				}
+				// Track cost
+				if part.Cost > 0 {
+					totalCost += part.Cost
+					onTokensUpdate(totalTokensInput, totalTokensOutput, totalTokensCache, totalCost)
+				}
 
 			case opencode.PartTypeText:
 				// Only forward text from assistant messages

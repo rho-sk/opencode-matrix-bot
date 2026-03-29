@@ -21,6 +21,10 @@ type RoomState struct {
 	CurrentQuestion   QuestionRequest   // Latest pending question
 	QuestionIndex     int               // Current question index (0-based)
 	QuestionAnswers   [][]string        // Accumulated answers for all questions
+	TokensInput       int               // Accumulated input tokens
+	TokensOutput      int               // Accumulated output tokens
+	TokensCache       int               // Accumulated cache read tokens
+	TotalCost         float64           // Total cost in dollars
 }
 
 // Bot holds all runtime state for the Matrix bot.
@@ -109,6 +113,9 @@ func (b *Bot) handleCommand(ctx context.Context, roomID id.RoomID, text string) 
 	case text == "/status":
 		b.cmdStatus(ctx, roomID)
 
+	case text == "/context":
+		b.cmdContext(ctx, roomID)
+
 	case text == "/todo":
 		b.cmdTodo(ctx, roomID)
 
@@ -167,6 +174,7 @@ func (b *Bot) cmdHelp(ctx context.Context, roomID id.RoomID) {
 /attach <ID> — pripoj sa na session (stačí prvých 8 znakov ID)
 /detach — odpoj sa od aktuálnej session
 /status — stav pripojenej session
+/context — tokeny a náklady aktuálnej session
 /todo — TODO zoznam pripojenej session
 /abort — prerušenie bežiacej session
 /new [názov] — vytvorenie novej session
@@ -273,6 +281,9 @@ func (b *Bot) cmdAttach(ctx context.Context, roomID id.RoomID, prefix string) {
 		},
 		func(qReq QuestionRequest) {
 			b.handleQuestionRequest(ctx, roomID, qReq)
+		},
+		func(inputTokens, outputTokens, cacheTokens int, cost float64) {
+			b.handleTokensUpdate(roomID, inputTokens, outputTokens, cacheTokens, cost)
 		})
 	b.mu.Lock()
 	state.SSECancel = cancel
@@ -311,6 +322,35 @@ func (b *Bot) cmdStatus(ctx context.Context, roomID id.RoomID) {
 		state = "neznámy"
 	}
 	b.sendMsg(roomID, fmt.Sprintf("%s %s", icon, state))
+}
+
+// cmdContext shows token usage and cost information for the current session.
+func (b *Bot) cmdContext(ctx context.Context, roomID id.RoomID) {
+	b.mu.Lock()
+	state := b.getOrCreateRoomState(roomID)
+	totalTokens := state.TokensInput + state.TokensOutput
+	cost := state.TotalCost
+	b.mu.Unlock()
+
+	if totalTokens == 0 && cost == 0 {
+		b.sendMsg(roomID, "📊 No token or cost data collected yet in this session.")
+		return
+	}
+
+	msg := fmt.Sprintf("📊 **Context Usage**\n\n")
+	msg += fmt.Sprintf("**Tokens:**\n")
+	msg += fmt.Sprintf("  ↑ Input: %s\n", formatNumber(state.TokensInput))
+	msg += fmt.Sprintf("  ↓ Output: %s\n", formatNumber(state.TokensOutput))
+	if state.TokensCache > 0 {
+		msg += fmt.Sprintf("  💾 Cache read: %s\n", formatNumber(state.TokensCache))
+	}
+	msg += fmt.Sprintf("  **Total: %s**\n\n", formatNumber(totalTokens))
+
+	if cost > 0 {
+		msg += fmt.Sprintf("💰 **Cost:** $%.4f", cost)
+	}
+
+	b.sendMsg(roomID, msg)
 }
 
 // cmdTodo shows the TODO list for the attached session.
@@ -675,6 +715,17 @@ func (b *Bot) displayCurrentQuestion(roomID id.RoomID, state *RoomState) {
 	b.sendMsg(roomID, msg)
 }
 
+// handleTokensUpdate updates context tracking for tokens and cost.
+func (b *Bot) handleTokensUpdate(roomID id.RoomID, inputTokens, outputTokens, cacheTokens int, cost float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	state := b.getOrCreateRoomState(roomID)
+	state.TokensInput = inputTokens
+	state.TokensOutput = outputTokens
+	state.TokensCache = cacheTokens
+	state.TotalCost = cost
+}
+
 // stateIcon returns an emoji icon for a session state string.
 func stateIcon(state string) string {
 	switch state {
@@ -689,4 +740,23 @@ func stateIcon(state string) string {
 	default:
 		return "❓"
 	}
+}
+
+// formatNumber formats a number with thousand separators for readability
+func formatNumber(n int) string {
+	// Simple approach: reverse string, insert commas every 3 digits, then reverse back
+	s := fmt.Sprintf("%d", n)
+	if len(s) <= 3 {
+		return s
+	}
+
+	runes := []rune(s)
+	var result []rune
+	for i, r := range runes {
+		if i > 0 && (len(runes)-i)%3 == 0 {
+			result = append(result, ',')
+		}
+		result = append(result, r)
+	}
+	return string(result)
 }
