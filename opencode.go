@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -203,12 +204,80 @@ func (c *OpencodeClient) GetLastMessageID(ctx context.Context, sessionID string)
 
 // RespondToPermission responds to a permission request.
 // response can be "once", "always", or "reject".
-func (c *OpencodeClient) RespondToPermission(ctx context.Context, sessionID string, permissionID string, response string) error {
-	_, err := c.sdk.Session.Permissions.Respond(ctx, sessionID, permissionID, opencode.SessionPermissionRespondParams{
-		Response: opencode.F(opencode.SessionPermissionRespondParamsResponse(response)),
-	})
+func (c *OpencodeClient) RespondToPermission(ctx context.Context, permissionID string, response string) error {
+	url := fmt.Sprintf("%s/permission/%s/reply", c.cfg.OpencodeURL, permissionID)
+	bodyMap := map[string]string{"reply": response}
+	bodyBytes, err := json.Marshal(bodyMap)
+	if err != nil {
+		return fmt.Errorf("marshal permission reply: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, io.NopCloser(bytes.NewReader(bodyBytes)))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.setAuth(req)
+
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("respond to permission: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		data, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("permission reply returned %d: %s", resp.StatusCode, string(data))
+	}
+	return nil
+}
+
+// RespondToQuestion responds to a question request.
+// answers is a slice of slices of strings (one slice per question, can have multiple answers)
+func (c *OpencodeClient) RespondToQuestion(ctx context.Context, questionID string, answers [][]string) error {
+	url := fmt.Sprintf("%s/question/%s/reply", c.cfg.OpencodeURL, questionID)
+	bodyMap := map[string]interface{}{"answers": answers}
+	bodyBytes, err := json.Marshal(bodyMap)
+	if err != nil {
+		return fmt.Errorf("marshal question reply: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, io.NopCloser(bytes.NewReader(bodyBytes)))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.setAuth(req)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("respond to question: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		data, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("question reply returned %d: %s", resp.StatusCode, string(data))
+	}
+	return nil
+}
+
+// RejectQuestion rejects a question request.
+func (c *OpencodeClient) RejectQuestion(ctx context.Context, questionID string) error {
+	url := fmt.Sprintf("%s/question/%s/reject", c.cfg.OpencodeURL, questionID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, io.NopCloser(bytes.NewReader([]byte("{}"))))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.setAuth(req)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("reject question: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		data, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("question reject returned %d: %s", resp.StatusCode, string(data))
 	}
 	return nil
 }

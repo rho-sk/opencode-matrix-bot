@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -12,11 +12,26 @@ import (
 	"maunium.net/go/mautrix/id"
 )
 
+// PermissionRequest holds permission request data from SSE event
+type PermissionRequest struct {
+	ID       string
+	Type     string
+	Metadata map[string]interface{}
+	Patterns []string
+}
+
+// QuestionRequest holds question request data from SSE event
+type QuestionRequest struct {
+	ID        string
+	Questions []map[string]interface{}
+}
+
 // StartSSEListener starts a goroutine that reads the OpenCode SSE stream using
 // the official SDK and forwards relevant events to the Matrix room.
 //
 // typingFn: called with true when processing starts, false when done.
-// onPermission: called when a permission request arrives (sessionID, Permission).
+// onPermission: called when a permission request arrives.
+// onQuestion: called when a question request arrives.
 func StartSSEListener(
 	ctx context.Context,
 	cfg *Config,
@@ -26,7 +41,8 @@ func StartSSEListener(
 	sendMsg func(id.RoomID, string),
 	lastMsgID string,
 	typingFn func(bool),
-	onPermission func(string, *opencode.Permission),
+	onPermission func(PermissionRequest),
+	onQuestion func(QuestionRequest),
 ) context.CancelFunc {
 	childCtx, cancel := context.WithCancel(ctx)
 
@@ -45,7 +61,7 @@ func StartSSEListener(
 			default:
 			}
 
-			err := runSDKSSELoop(childCtx, oc, attachedID, roomID, sendMsg, lastMsgID, typingFn, onPermission)
+			err := runSDKSSELoop(childCtx, oc, attachedID, roomID, sendMsg, lastMsgID, typingFn, onPermission, onQuestion)
 			if err != nil {
 				select {
 				case <-childCtx.Done():
@@ -124,7 +140,8 @@ func runSDKSSELoop(
 	sendMsg func(id.RoomID, string),
 	lastMsgID string,
 	typingFn func(bool),
-	onPermission func(string, *opencode.Permission),
+	onPermission func(PermissionRequest),
+	onQuestion func(QuestionRequest),
 ) error {
 	// Wrap context with a heartbeat timeout — if no event arrives for 90s, reconnect
 	const heartbeatTimeout = 90 * time.Second
@@ -288,24 +305,6 @@ func runSDKSSELoop(
 				sendMsg(roomID, "❌ Chyba v session")
 			}
 
-		case opencode.EventListResponseTypePermissionUpdated:
-			perm, ok := evt.Properties.(opencode.Permission)
-			if !ok {
-				continue
-			}
-			if !tracked.contains(perm.SessionID) {
-				continue
-			}
-
-			// Format and send permission message
-			msg := formatPermissionMessage(&perm)
-			sendMsg(roomID, msg)
-
-			// Notify bot about pending permission
-			if onPermission != nil {
-				onPermission(perm.SessionID, &perm)
-			}
-
 		case opencode.EventListResponseTypeSessionCreated:
 			props, ok := evt.Properties.(opencode.EventListResponseEventSessionCreatedProperties)
 			if !ok {
@@ -321,6 +320,29 @@ func runSDKSSELoop(
 					Msg("Tracking new child session")
 				sendMsg(roomID, fmt.Sprintf("🔀 Child session: `%s`", newSession.ID[:8]))
 			}
+
+		default:
+			// Handle permission.asked and question.asked events (not in SDK yet)
+			eventType := string(evt.Type)
+			log.Debug().Str("eventType", eventType).Msg("Unhandled event type")
+
+			if eventType == "permission.asked" {
+				// Flush any buffered text BEFORE displaying permission request
+				flushPendingText(deltaAccum, deltaLastSent, sendMsg, roomID, "")
+				// Parse and display permission request immediately
+				var permReq PermissionRequest
+				parsePermissionAskedRaw(evt, &permReq)
+				log.Debug().Str("permissionID", permReq.ID).Msg("Permission request received")
+				onPermission(permReq)
+			} else if eventType == "question.asked" {
+				// Flush any buffered text BEFORE displaying question request
+				flushPendingText(deltaAccum, deltaLastSent, sendMsg, roomID, "")
+				// Parse and display question request immediately
+				var qReq QuestionRequest
+				parseQuestionAskedRaw(evt, &qReq)
+				log.Debug().Str("questionID", qReq.ID).Msg("Question request received")
+				onQuestion(qReq)
+			}
 		}
 	}
 
@@ -335,16 +357,247 @@ func runSDKSSELoop(
 	return nil
 }
 
-// formatPermissionMessage formats a permission request as a user-friendly message.
-func formatPermissionMessage(perm *opencode.Permission) string {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("❓ Permission Request: %s\n", perm.Title))
-	if perm.Pattern != nil {
-		sb.WriteString(fmt.Sprintf("Pattern: %v\n", perm.Pattern))
+// flushPendingText sends any buffered text to the chat before permission/question requests
+// This ensures proper message ordering: buffered text appears before the request that may have triggered it
+func flushPendingText(
+	deltaAccum map[string]string,
+	deltaLastSent map[string]int,
+	sendMsg func(id.RoomID, string),
+	roomID id.RoomID,
+	prefix string,
+) {
+	for partID, accumulated := range deltaAccum {
+		sent := deltaLastSent[partID]
+		if len(accumulated) > sent {
+			tail := accumulated[sent:]
+			if len([]rune(tail)) > 3000 {
+				runes := []rune(tail)
+				tail = string(runes[:3000]) + "…"
+			}
+			sendMsg(roomID, prefix+tail)
+			// Update deltaLastSent so we don't resend this text
+			deltaLastSent[partID] = len(accumulated)
+		}
 	}
-	sb.WriteString("\nAvailable commands:\n")
-	sb.WriteString("/allow-once — Grant once\n")
-	sb.WriteString("/allow-always — Grant always\n")
-	sb.WriteString("/deny — Reject")
-	return sb.String()
+}
+
+// parsePermissionAskedRaw parses permission.asked event and stores result in req
+// Used to defer displaying the request until after text is flushed
+func parsePermissionAskedRaw(evt opencode.EventListResponse, req *PermissionRequest) {
+	if req == nil {
+		return
+	}
+
+	// Parse raw JSON event to extract properties
+	rawJSON := evt.JSON.RawJSON()
+
+	var rawEvent map[string]interface{}
+	if err := json.Unmarshal([]byte(rawJSON), &rawEvent); err != nil {
+		log.Warn().Err(err).Msg("Failed to unmarshal permission.asked event JSON")
+		return
+	}
+
+	// Extract properties object
+	propsInterface, ok := rawEvent["properties"]
+	if !ok {
+		log.Warn().Msg("permission.asked event missing properties field")
+		return
+	}
+
+	props, ok := propsInterface.(map[string]interface{})
+	if !ok {
+		log.Warn().Interface("properties", propsInterface).Msg("permission.asked properties is not an object")
+		return
+	}
+
+	parsePermissionAsked(props, req)
+}
+
+// parseQuestionAskedRaw parses question.asked event and stores result in req
+// Used to defer displaying the request until after text is flushed
+func parseQuestionAskedRaw(evt opencode.EventListResponse, req *QuestionRequest) {
+	if req == nil {
+		return
+	}
+
+	// Parse raw JSON event to extract properties
+	rawJSON := evt.JSON.RawJSON()
+
+	var rawEvent map[string]interface{}
+	if err := json.Unmarshal([]byte(rawJSON), &rawEvent); err != nil {
+		log.Warn().Err(err).Msg("Failed to unmarshal question.asked event JSON")
+		return
+	}
+
+	// Extract properties object
+	propsInterface, ok := rawEvent["properties"]
+	if !ok {
+		log.Warn().Msg("question.asked event missing properties field")
+		return
+	}
+
+	props, ok := propsInterface.(map[string]interface{})
+	if !ok {
+		log.Warn().Interface("properties", propsInterface).Msg("question.asked properties is not an object")
+		return
+	}
+
+	parseQuestionAsked(props, req)
+}
+
+// handlePermissionAskedRaw parses permission.asked event from raw EventListResponse
+func handlePermissionAskedRaw(evt opencode.EventListResponse, callback func(PermissionRequest)) {
+	if callback == nil {
+		return
+	}
+
+	// Parse raw JSON event to extract properties
+	// SDK doesn't fully parse unknown event types, so we need to do it manually
+	rawJSON := evt.JSON.RawJSON()
+
+	var rawEvent map[string]interface{}
+	if err := json.Unmarshal([]byte(rawJSON), &rawEvent); err != nil {
+		log.Warn().Err(err).Msg("Failed to unmarshal permission.asked event JSON")
+		return
+	}
+
+	// Extract properties object
+	propsInterface, ok := rawEvent["properties"]
+	if !ok {
+		log.Warn().Msg("permission.asked event missing properties field")
+		return
+	}
+
+	props, ok := propsInterface.(map[string]interface{})
+	if !ok {
+		log.Warn().Interface("properties", propsInterface).Msg("permission.asked properties is not an object")
+		return
+	}
+
+	handlePermissionAsked(props, callback)
+}
+
+// handleQuestionAskedRaw parses question.asked event from raw EventListResponse
+func handleQuestionAskedRaw(evt opencode.EventListResponse, callback func(QuestionRequest)) {
+	if callback == nil {
+		return
+	}
+
+	// Parse raw JSON event to extract properties
+	rawJSON := evt.JSON.RawJSON()
+
+	var rawEvent map[string]interface{}
+	if err := json.Unmarshal([]byte(rawJSON), &rawEvent); err != nil {
+		log.Warn().Err(err).Msg("Failed to unmarshal question.asked event JSON")
+		return
+	}
+
+	// Extract properties object
+	propsInterface, ok := rawEvent["properties"]
+	if !ok {
+		log.Warn().Msg("question.asked event missing properties field")
+		return
+	}
+
+	props, ok := propsInterface.(map[string]interface{})
+	if !ok {
+		log.Warn().Interface("properties", propsInterface).Msg("question.asked properties is not an object")
+		return
+	}
+
+	handleQuestionAsked(props, callback)
+}
+
+// parsePermissionAsked parses permission properties into a PermissionRequest (no callback)
+func parsePermissionAsked(props interface{}, req *PermissionRequest) {
+	if req == nil {
+		return
+	}
+
+	// Try to parse as a map (generic JSON object)
+	propMap, ok := props.(map[string]interface{})
+	if !ok {
+		log.Warn().Interface("properties", props).Msg("Failed to parse permission.asked properties")
+		return
+	}
+
+	// Extract ID
+	if id, ok := propMap["id"].(string); ok {
+		req.ID = id
+	}
+
+	// Extract permission type
+	if permType, ok := propMap["permission"].(string); ok {
+		req.Type = permType
+	}
+
+	// Extract metadata
+	if meta, ok := propMap["metadata"].(map[string]interface{}); ok {
+		req.Metadata = meta
+	}
+
+	// Extract patterns
+	if patterns, ok := propMap["patterns"].([]interface{}); ok {
+		req.Patterns = make([]string, 0, len(patterns))
+		for _, p := range patterns {
+			if str, ok := p.(string); ok {
+				req.Patterns = append(req.Patterns, str)
+			}
+		}
+	}
+
+	log.Info().Str("permissionID", req.ID).Str("type", req.Type).Msg("Permission request parsed")
+}
+
+// handlePermissionAsked parses permission.asked event and calls the callback
+func handlePermissionAsked(props interface{}, callback func(PermissionRequest)) {
+	if callback == nil {
+		return
+	}
+
+	req := PermissionRequest{}
+	parsePermissionAsked(props, &req)
+	callback(req)
+}
+
+// parseQuestionAsked parses question properties into a QuestionRequest (no callback)
+func parseQuestionAsked(props interface{}, req *QuestionRequest) {
+	if req == nil {
+		return
+	}
+
+	// Try to parse as a map
+	propMap, ok := props.(map[string]interface{})
+	if !ok {
+		log.Warn().Interface("properties", props).Msg("Failed to parse question.asked properties")
+		return
+	}
+
+	// Extract ID
+	if id, ok := propMap["id"].(string); ok {
+		req.ID = id
+	}
+
+	// Extract questions
+	if questions, ok := propMap["questions"].([]interface{}); ok {
+		req.Questions = make([]map[string]interface{}, 0, len(questions))
+		for _, q := range questions {
+			if qMap, ok := q.(map[string]interface{}); ok {
+				req.Questions = append(req.Questions, qMap)
+			}
+		}
+	}
+
+	log.Info().Str("questionID", req.ID).Int("questionCount", len(req.Questions)).Msg("Question request parsed")
+}
+
+// handleQuestionAsked parses question.asked event and calls the callback
+func handleQuestionAsked(props interface{}, callback func(QuestionRequest)) {
+	if callback == nil {
+		return
+	}
+
+	req := QuestionRequest{}
+	parseQuestionAsked(props, &req)
+	callback(req)
 }

@@ -8,17 +8,17 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
-	opencode "github.com/sst/opencode-sdk-go"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
 
-// RoomState holds per-room state: which session is attached, SSE cancel func, and pending permissions.
+// RoomState holds per-room state: which session is attached and the SSE cancel func.
 type RoomState struct {
-	AttachedSessionID  string
-	SSECancel          context.CancelFunc
-	PendingPermissions map[string]*opencode.Permission // sessionID -> Permission
+	AttachedSessionID string
+	SSECancel         context.CancelFunc
+	CurrentPermission PermissionRequest // Latest pending permission
+	CurrentQuestion   QuestionRequest   // Latest pending question
 }
 
 // Bot holds all runtime state for the Matrix bot.
@@ -130,6 +130,17 @@ func (b *Bot) handleCommand(ctx context.Context, roomID id.RoomID, text string) 
 	case text == "/deny":
 		b.cmdDeny(ctx, roomID)
 
+	case strings.HasPrefix(text, "/answer"):
+		parts := strings.Fields(text)
+		if len(parts) < 2 {
+			b.sendMsg(roomID, "Použitie: /answer <answers...>")
+			return
+		}
+		b.cmdAnswer(ctx, roomID, parts[1:])
+
+	case text == "/dismiss-question":
+		b.cmdDismissQuestion(ctx, roomID)
+
 	case strings.HasPrefix(text, "/"):
 		b.sendMsg(roomID, fmt.Sprintf("Neznámy príkaz: %s\nPoužite /help pre zoznam príkazov.", text))
 
@@ -233,11 +244,16 @@ func (b *Bot) cmdAttach(ctx context.Context, roomID id.RoomID, prefix string) {
 	log.Debug().Str("lastMsgID", lastMsgID).Msg("Attaching SSE listener")
 
 	// Start SSE listener
-	cancel := StartSSEListener(ctx, b.cfg, b.opencode, matched.id, roomID, b.sendMsg, lastMsgID, func(typing bool) {
-		b.sendTyping(roomID, typing)
-	}, func(sessionID string, perm *opencode.Permission) {
-		b.storePendingPermission(roomID, sessionID, perm)
-	})
+	cancel := StartSSEListener(ctx, b.cfg, b.opencode, matched.id, roomID, b.sendMsg, lastMsgID,
+		func(typing bool) {
+			b.sendTyping(roomID, typing)
+		},
+		func(permReq PermissionRequest) {
+			b.handlePermissionRequest(ctx, roomID, permReq)
+		},
+		func(qReq QuestionRequest) {
+			b.handleQuestionRequest(ctx, roomID, qReq)
+		})
 	b.mu.Lock()
 	state.SSECancel = cancel
 	b.mu.Unlock()
@@ -333,6 +349,87 @@ func (b *Bot) cmdNew(ctx context.Context, roomID id.RoomID, title string) {
 	b.cmdAttach(ctx, roomID, prefix)
 }
 
+// cmdAllowOnce grants the current pending permission once.
+func (b *Bot) cmdAllowOnce(ctx context.Context, roomID id.RoomID) {
+	b.respondToPermission(ctx, roomID, "once")
+}
+
+// cmdAllowAlways grants the current pending permission always.
+func (b *Bot) cmdAllowAlways(ctx context.Context, roomID id.RoomID) {
+	b.respondToPermission(ctx, roomID, "always")
+}
+
+// cmdDeny denies the current pending permission.
+func (b *Bot) cmdDeny(ctx context.Context, roomID id.RoomID) {
+	b.respondToPermission(ctx, roomID, "reject")
+}
+
+// respondToPermission is a helper that responds to the current pending permission.
+func (b *Bot) respondToPermission(ctx context.Context, roomID id.RoomID, response string) {
+	b.mu.Lock()
+	state := b.getOrCreateRoomState(roomID)
+	perm := state.CurrentPermission
+	state.CurrentPermission = PermissionRequest{} // Clear current permission
+	b.mu.Unlock()
+
+	if perm.ID == "" {
+		b.sendMsg(roomID, "❌ No pending permission to respond to.")
+		return
+	}
+
+	if err := b.opencode.RespondToPermission(ctx, perm.ID, response); err != nil {
+		b.sendMsg(roomID, fmt.Sprintf("❌ Chyba pri odpoveди na permission: %s", err))
+		return
+	}
+
+	b.sendMsg(roomID, fmt.Sprintf("✅ Permission: %s (%s)", perm.Type, response))
+}
+
+// cmdAnswer answers the current pending question.
+func (b *Bot) cmdAnswer(ctx context.Context, roomID id.RoomID, answers []string) {
+	b.mu.Lock()
+	state := b.getOrCreateRoomState(roomID)
+	qReq := state.CurrentQuestion
+	state.CurrentQuestion = QuestionRequest{} // Clear current question
+	b.mu.Unlock()
+
+	if qReq.ID == "" {
+		b.sendMsg(roomID, "❌ No pending question to answer.")
+		return
+	}
+
+	// Convert string answers to [][]string format
+	answersList := [][]string{answers}
+
+	if err := b.opencode.RespondToQuestion(ctx, qReq.ID, answersList); err != nil {
+		b.sendMsg(roomID, fmt.Sprintf("❌ Chyba pri odpoveди na otázku: %s", err))
+		return
+	}
+
+	b.sendMsg(roomID, fmt.Sprintf("✅ Question answered: %d answers submitted", len(answers)))
+}
+
+// cmdDismissQuestion dismisses the current pending question.
+func (b *Bot) cmdDismissQuestion(ctx context.Context, roomID id.RoomID) {
+	b.mu.Lock()
+	state := b.getOrCreateRoomState(roomID)
+	qReq := state.CurrentQuestion
+	state.CurrentQuestion = QuestionRequest{} // Clear current question
+	b.mu.Unlock()
+
+	if qReq.ID == "" {
+		b.sendMsg(roomID, "❌ No pending question to dismiss.")
+		return
+	}
+
+	if err := b.opencode.RejectQuestion(ctx, qReq.ID); err != nil {
+		b.sendMsg(roomID, fmt.Sprintf("❌ Chyba pri odmietnutí otázky: %s", err))
+		return
+	}
+
+	b.sendMsg(roomID, "✅ Question dismissed")
+}
+
 // cmdPrompt sends a free-text message to the attached session.
 func (b *Bot) cmdPrompt(ctx context.Context, roomID id.RoomID, text string) {
 	sessionID := b.attachedSessionID(roomID)
@@ -343,58 +440,6 @@ func (b *Bot) cmdPrompt(ctx context.Context, roomID id.RoomID, text string) {
 	if err := b.opencode.PromptAsync(ctx, sessionID, text); err != nil {
 		b.sendMsg(roomID, fmt.Sprintf("❌ Chyba pri odosielaní: %s", err))
 	}
-}
-
-// cmdAllowOnce responds to a permission request with "once".
-func (b *Bot) cmdAllowOnce(ctx context.Context, roomID id.RoomID) {
-	b.respondToPermission(ctx, roomID, "once")
-}
-
-// cmdAllowAlways responds to a permission request with "always".
-func (b *Bot) cmdAllowAlways(ctx context.Context, roomID id.RoomID) {
-	b.respondToPermission(ctx, roomID, "always")
-}
-
-// cmdDeny responds to a permission request with "reject".
-func (b *Bot) cmdDeny(ctx context.Context, roomID id.RoomID) {
-	b.respondToPermission(ctx, roomID, "reject")
-}
-
-// respondToPermission is a helper that responds to a pending permission.
-func (b *Bot) respondToPermission(ctx context.Context, roomID id.RoomID, response string) {
-	sessionID := b.attachedSessionID(roomID)
-	if sessionID == "" {
-		b.sendMsg(roomID, "❌ Nie si pripojený k žiadnej session.")
-		return
-	}
-
-	b.mu.Lock()
-	state := b.getOrCreateRoomState(roomID)
-	perm := state.PendingPermissions[sessionID]
-	if perm != nil {
-		delete(state.PendingPermissions, sessionID)
-	}
-	b.mu.Unlock()
-
-	if perm == nil {
-		b.sendMsg(roomID, "❌ Permission expired or not found.")
-		return
-	}
-
-	if err := b.opencode.RespondToPermission(ctx, sessionID, perm.ID, response); err != nil {
-		b.sendMsg(roomID, fmt.Sprintf("❌ Chyba pri odpovedaní: %s", err))
-		return
-	}
-
-	b.sendMsg(roomID, fmt.Sprintf("✅ Permission: %s (%s)", perm.Title, response))
-}
-
-// storePendingPermission stores a permission request for a session.
-func (b *Bot) storePendingPermission(roomID id.RoomID, sessionID string, perm *opencode.Permission) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	state := b.getOrCreateRoomState(roomID)
-	state.PendingPermissions[sessionID] = perm
 }
 
 // sendMsg sends a plain text message to a Matrix room.
@@ -443,11 +488,69 @@ func (b *Bot) attachedSessionID(roomID id.RoomID) string {
 // Caller must hold b.mu.
 func (b *Bot) getOrCreateRoomState(roomID id.RoomID) *RoomState {
 	if b.roomStates[roomID] == nil {
-		b.roomStates[roomID] = &RoomState{
-			PendingPermissions: make(map[string]*opencode.Permission),
-		}
+		b.roomStates[roomID] = &RoomState{}
 	}
 	return b.roomStates[roomID]
+}
+
+// handlePermissionRequest handles a permission request from OpenCode
+func (b *Bot) handlePermissionRequest(ctx context.Context, roomID id.RoomID, permReq PermissionRequest) {
+	// Build description from metadata or patterns
+	description := fmt.Sprintf("Permission requested: %s\n", permReq.Type)
+	if patterns := permReq.Patterns; len(patterns) > 0 {
+		for _, p := range patterns {
+			description += fmt.Sprintf("  • %s\n", p)
+		}
+	}
+
+	// Send permission dialog to user - NO ID REQUIRED
+	msg := fmt.Sprintf(
+		"❓ **Permission required**\n%s\n"+
+			"Respond with:\n"+
+			"- `/allow-once` — Grant once\n"+
+			"- `/allow-always` — Grant always\n"+
+			"- `/deny` — Reject",
+		description)
+	b.sendMsg(roomID, msg)
+
+	// Store as current permission for later response
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	state := b.getOrCreateRoomState(roomID)
+	state.CurrentPermission = permReq
+}
+
+// handleQuestionRequest handles a question request from OpenCode
+func (b *Bot) handleQuestionRequest(ctx context.Context, roomID id.RoomID, qReq QuestionRequest) {
+	// Build question message
+	msg := "❓ **Question**\n\n"
+
+	for i, qMap := range qReq.Questions {
+		if question, ok := qMap["question"].(string); ok {
+			msg += fmt.Sprintf("**Q%d.** %s\n", i+1, question)
+
+			// Add options if available
+			if options, ok := qMap["options"].([]interface{}); ok {
+				for _, opt := range options {
+					if optMap, ok := opt.(map[string]interface{}); ok {
+						if label, ok := optMap["label"].(string); ok {
+							msg += fmt.Sprintf("  • %s\n", label)
+						}
+					}
+				}
+			}
+			msg += "\n"
+		}
+	}
+
+	msg += "Respond with:\n- `/answer <your answers>` — Submit answers\n- `/dismiss-question` — Dismiss"
+	b.sendMsg(roomID, msg)
+
+	// Store as current question for later response
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	state := b.getOrCreateRoomState(roomID)
+	state.CurrentQuestion = qReq
 }
 
 // stateIcon returns an emoji icon for a session state string.
