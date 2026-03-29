@@ -19,6 +19,8 @@ type RoomState struct {
 	SSECancel         context.CancelFunc
 	CurrentPermission PermissionRequest // Latest pending permission
 	CurrentQuestion   QuestionRequest   // Latest pending question
+	QuestionIndex     int               // Current question index (0-based)
+	QuestionAnswers   [][]string        // Accumulated answers for all questions
 }
 
 // Bot holds all runtime state for the Matrix bot.
@@ -141,6 +143,12 @@ func (b *Bot) handleCommand(ctx context.Context, roomID id.RoomID, text string) 
 	case text == "/dismiss-question":
 		b.cmdDismissQuestion(ctx, roomID)
 
+	case text == "/reject":
+		b.cmdRejectQuestion(ctx, roomID)
+
+	case text == "/reject_all":
+		b.cmdRejectAllQuestions(ctx, roomID)
+
 	case strings.HasPrefix(text, "/"):
 		b.sendMsg(roomID, fmt.Sprintf("Neznámy príkaz: %s\nPoužite /help pre zoznam príkazov.", text))
 
@@ -152,6 +160,8 @@ func (b *Bot) handleCommand(ctx context.Context, roomID id.RoomID, text string) 
 // cmdHelp sends the help message.
 func (b *Bot) cmdHelp(ctx context.Context, roomID id.RoomID) {
 	help := `Dostupné príkazy:
+
+**Session Management:**
 /help — tento zoznam
 /sessions — zoznam všetkých sessions
 /attach <ID> — pripoj sa na session (stačí prvých 8 znakov ID)
@@ -160,6 +170,16 @@ func (b *Bot) cmdHelp(ctx context.Context, roomID id.RoomID) {
 /todo — TODO zoznam pripojenej session
 /abort — prerušenie bežiacej session
 /new [názov] — vytvorenie novej session
+
+**Permissions:**
+/allow-once — udelenie povolenia na jednorázové použitie
+/allow-always — trvalé udelenie povolenia
+/deny — odmietnutie povolenia
+
+**Questions (stepwise answering):**
+/answer <text|number> — odpoveď na aktuálnu otázku (text alebo číslo opcije)
+/reject — preskočenie aktuálnej otázky (bez odpovede)
+/reject_all — zrušenie všetkých otázok
 
 Akákoľvek iná správa sa odošle do pripojenej session.`
 	b.sendMsg(roomID, help)
@@ -385,12 +405,11 @@ func (b *Bot) respondToPermission(ctx context.Context, roomID id.RoomID, respons
 	b.sendMsg(roomID, fmt.Sprintf("✅ Permission: %s (%s)", perm.Type, response))
 }
 
-// cmdAnswer answers the current pending question.
+// cmdAnswer answers the current question and moves to the next one
 func (b *Bot) cmdAnswer(ctx context.Context, roomID id.RoomID, answers []string) {
 	b.mu.Lock()
 	state := b.getOrCreateRoomState(roomID)
 	qReq := state.CurrentQuestion
-	state.CurrentQuestion = QuestionRequest{} // Clear current question
 	b.mu.Unlock()
 
 	if qReq.ID == "" {
@@ -398,36 +417,114 @@ func (b *Bot) cmdAnswer(ctx context.Context, roomID id.RoomID, answers []string)
 		return
 	}
 
-	// Convert string answers to [][]string format
-	answersList := [][]string{answers}
-
-	if err := b.opencode.RespondToQuestion(ctx, qReq.ID, answersList); err != nil {
-		b.sendMsg(roomID, fmt.Sprintf("❌ Chyba pri odpoveди na otázku: %s", err))
+	if state.QuestionIndex >= len(qReq.Questions) {
+		b.sendMsg(roomID, "❌ Invalid question index")
 		return
 	}
 
-	b.sendMsg(roomID, fmt.Sprintf("✅ Question answered: %d answers submitted", len(answers)))
+	// Store answer for current question
+	b.mu.Lock()
+	state.QuestionAnswers[state.QuestionIndex] = answers
+	state.QuestionIndex++
+	b.mu.Unlock()
+
+	// Check if there are more questions
+	if state.QuestionIndex < len(qReq.Questions) {
+		b.mu.Lock()
+		b.displayCurrentQuestion(roomID, state)
+		b.mu.Unlock()
+		return
+	}
+
+	// All questions answered - submit final answers
+	b.mu.Lock()
+	finalAnswers := state.QuestionAnswers
+	state.CurrentQuestion = QuestionRequest{} // Clear
+	state.QuestionIndex = 0
+	state.QuestionAnswers = nil
+	b.mu.Unlock()
+
+	if err := b.opencode.RespondToQuestion(ctx, qReq.ID, finalAnswers); err != nil {
+		b.sendMsg(roomID, fmt.Sprintf("❌ Chyba pri odpoveди na otázky: %s", err))
+		return
+	}
+
+	b.sendMsg(roomID, fmt.Sprintf("✅ All questions answered: %d answers submitted", len(finalAnswers)))
 }
 
-// cmdDismissQuestion dismisses the current pending question.
-func (b *Bot) cmdDismissQuestion(ctx context.Context, roomID id.RoomID) {
+// cmdRejectQuestion rejects the current question and moves to the next one
+func (b *Bot) cmdRejectQuestion(ctx context.Context, roomID id.RoomID) {
 	b.mu.Lock()
 	state := b.getOrCreateRoomState(roomID)
 	qReq := state.CurrentQuestion
-	state.CurrentQuestion = QuestionRequest{} // Clear current question
 	b.mu.Unlock()
 
 	if qReq.ID == "" {
-		b.sendMsg(roomID, "❌ No pending question to dismiss.")
+		b.sendMsg(roomID, "❌ No pending question to reject.")
+		return
+	}
+
+	if state.QuestionIndex >= len(qReq.Questions) {
+		b.sendMsg(roomID, "❌ Invalid question index")
+		return
+	}
+
+	// Store empty answer for current question
+	b.mu.Lock()
+	state.QuestionAnswers[state.QuestionIndex] = []string{}
+	state.QuestionIndex++
+	b.mu.Unlock()
+
+	// Check if there are more questions
+	if state.QuestionIndex < len(qReq.Questions) {
+		b.mu.Lock()
+		b.displayCurrentQuestion(roomID, state)
+		b.mu.Unlock()
+		return
+	}
+
+	// All questions processed - submit final answers
+	b.mu.Lock()
+	finalAnswers := state.QuestionAnswers
+	state.CurrentQuestion = QuestionRequest{} // Clear
+	state.QuestionIndex = 0
+	state.QuestionAnswers = nil
+	b.mu.Unlock()
+
+	if err := b.opencode.RespondToQuestion(ctx, qReq.ID, finalAnswers); err != nil {
+		b.sendMsg(roomID, fmt.Sprintf("❌ Chyba pri odpoveди na otázky: %s", err))
+		return
+	}
+
+	b.sendMsg(roomID, fmt.Sprintf("✅ Questions processing complete: %d answers submitted", len(finalAnswers)))
+}
+
+// cmdRejectAllQuestions cancels all question processing
+func (b *Bot) cmdRejectAllQuestions(ctx context.Context, roomID id.RoomID) {
+	b.mu.Lock()
+	state := b.getOrCreateRoomState(roomID)
+	qReq := state.CurrentQuestion
+	state.CurrentQuestion = QuestionRequest{} // Clear
+	state.QuestionIndex = 0
+	state.QuestionAnswers = nil
+	b.mu.Unlock()
+
+	if qReq.ID == "" {
+		b.sendMsg(roomID, "❌ No pending questions to reject.")
 		return
 	}
 
 	if err := b.opencode.RejectQuestion(ctx, qReq.ID); err != nil {
-		b.sendMsg(roomID, fmt.Sprintf("❌ Chyba pri odmietnutí otázky: %s", err))
+		b.sendMsg(roomID, fmt.Sprintf("❌ Chyba pri odmietnutí otázok: %s", err))
 		return
 	}
 
-	b.sendMsg(roomID, "✅ Question dismissed")
+	b.sendMsg(roomID, "✅ All questions rejected")
+}
+
+// cmdDismissQuestion is deprecated, kept for backwards compatibility
+func (b *Bot) cmdDismissQuestion(ctx context.Context, roomID id.RoomID) {
+	b.cmdRejectAllQuestions(ctx, roomID)
 }
 
 // cmdPrompt sends a free-text message to the attached session.
@@ -522,35 +619,60 @@ func (b *Bot) handlePermissionRequest(ctx context.Context, roomID id.RoomID, per
 
 // handleQuestionRequest handles a question request from OpenCode
 func (b *Bot) handleQuestionRequest(ctx context.Context, roomID id.RoomID, qReq QuestionRequest) {
-	// Build question message
-	msg := "❓ **Question**\n\n"
-
-	for i, qMap := range qReq.Questions {
-		if question, ok := qMap["question"].(string); ok {
-			msg += fmt.Sprintf("**Q%d.** %s\n", i+1, question)
-
-			// Add options if available
-			if options, ok := qMap["options"].([]interface{}); ok {
-				for _, opt := range options {
-					if optMap, ok := opt.(map[string]interface{}); ok {
-						if label, ok := optMap["label"].(string); ok {
-							msg += fmt.Sprintf("  • %s\n", label)
-						}
-					}
-				}
-			}
-			msg += "\n"
-		}
-	}
-
-	msg += "Respond with:\n- `/answer <your answers>` — Submit answers\n- `/dismiss-question` — Dismiss"
-	b.sendMsg(roomID, msg)
-
-	// Store as current question for later response
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	state := b.getOrCreateRoomState(roomID)
 	state.CurrentQuestion = qReq
+	state.QuestionIndex = 0
+	state.QuestionAnswers = make([][]string, len(qReq.Questions))
+
+	// Display first question
+	b.displayCurrentQuestion(roomID, state)
+}
+
+// displayCurrentQuestion shows the current question in the sequence
+func (b *Bot) displayCurrentQuestion(roomID id.RoomID, state *RoomState) {
+	qReq := state.CurrentQuestion
+	if state.QuestionIndex >= len(qReq.Questions) {
+		b.sendMsg(roomID, "❌ Invalid question index")
+		return
+	}
+
+	qMap := qReq.Questions[state.QuestionIndex]
+	totalQuestions := len(qReq.Questions)
+	currentQNum := state.QuestionIndex + 1
+
+	msg := fmt.Sprintf("❓ **Question %d/%d**\n\n", currentQNum, totalQuestions)
+
+	if question, ok := qMap["question"].(string); ok {
+		msg += fmt.Sprintf("**%s**\n\n", question)
+	}
+
+	// Add options if available
+	optionCount := 0
+	if options, ok := qMap["options"].([]interface{}); ok {
+		for idx, opt := range options {
+			if optMap, ok := opt.(map[string]interface{}); ok {
+				if label, ok := optMap["label"].(string); ok {
+					optionCount++
+					msg += fmt.Sprintf("%d. %s\n", idx+1, label)
+					if desc, ok := optMap["description"].(string); ok && desc != "" {
+						msg += fmt.Sprintf("   _{%s}_\n", desc)
+					}
+				}
+			}
+		}
+	}
+
+	msg += "\nRespond with:\n"
+	if optionCount > 0 {
+		msg += "- `/answer <number>` — Answer by option number (e.g., `/answer 1`)\n"
+	}
+	msg += "- `/answer <text>` — Custom answer\n"
+	msg += "- `/reject` — Skip this question\n"
+	msg += "- `/reject_all` — Cancel all questions"
+
+	b.sendMsg(roomID, msg)
 }
 
 // stateIcon returns an emoji icon for a session state string.
